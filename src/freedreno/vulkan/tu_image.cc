@@ -32,6 +32,10 @@
 #include "tu_subsampled_image.h"
 #include "tu_wsi.h"
 
+#if DETECT_OS_ANDROID
+#include <unistd.h>
+#endif
+
 uint32_t
 tu6_plane_count(VkFormat format)
 {
@@ -855,6 +859,10 @@ tu_CreateImage(VkDevice _device,
    if (!image)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+#if DETECT_OS_ANDROID
+   image->anb_allocator = alloc ? *alloc : device->vk.alloc;
+#endif
+
    if (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
       const VkImageDrmFormatModifierListCreateInfoEXT *mod_info =
          vk_find_struct_const(pCreateInfo->pNext,
@@ -998,6 +1006,60 @@ tu_DestroyImage(VkDevice _device,
    vk_image_destroy(&device->vk, pAllocator, &image->vk);
 }
 
+#if DETECT_OS_ANDROID
+static VkResult
+tu_bind_android_native_buffer(struct tu_device *device, struct tu_image *image,
+                              const VkBindImageMemoryInfo *bind_info)
+{
+   const VkNativeBufferANDROID *native_buffer =
+      vk_find_struct_const(bind_info->pNext, NATIVE_BUFFER_ANDROID);
+
+   /* Android supplies the buffer at first acquire for deferred swapchains.
+    * Never replace image-owned memory, including after a failed import/bind.
+    */
+   if (!native_buffer || !native_buffer->handle ||
+       native_buffer->handle->numFds < 1 ||
+       native_buffer->handle->data[0] < 0 || bind_info->memoryOffset != 0 ||
+       image->mem || image->vk.anb_memory ||
+       vk_image_is_android_hardware_buffer(&image->vk))
+      return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "invalid deferred Android native buffer bind");
+
+   /* The shared import helper derives allocationSize from this dma-buf.
+    * Reject zero/invalid sizes before it can allocate NULL memory or leak
+    * the duplicated descriptor on the zero-sized allocation fast path.
+    */
+   if (lseek(native_buffer->handle->data[0], 0, SEEK_END) <= 0)
+      return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "invalid Android native buffer size");
+
+   const VkImageCreateInfo anb_ci = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .pNext = native_buffer,
+   };
+   VkImageDrmFormatModifierExplicitCreateInfoEXT eci;
+   VkSubresourceLayout a_plane_layouts[TU_MAX_PLANE_COUNT];
+   VkResult result = vk_android_get_anb_layout(
+      &anb_ci, &eci, a_plane_layouts, TU_MAX_PLANE_COUNT);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* Replace the provisional create-time layout with the actual buffer's. */
+   image->total_size = 0;
+   result = TU_CALLX(device, tu_image_update_layout)(
+      device, image, eci.drmFormatModifier, a_plane_layouts);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* The helper duplicates the caller fd and owns the memory on the image.
+    * Its recursive bind uses real memory, bypassing this deferred path.
+    * Destruction frees that memory even when the inner bind fails.
+    */
+   return vk_android_import_anb(&device->vk, &anb_ci, &image->anb_allocator,
+                                 &image->vk);
+}
+#endif
+
 static VkResult
 tu_image_bind(struct tu_device *device,
               const VkBindImageMemoryInfo *bind_info)
@@ -1010,8 +1072,7 @@ tu_image_bind(struct tu_device *device,
 
    if (!mem) {
 #if DETECT_OS_ANDROID
-      /* TODO handle VkNativeBufferANDROID */
-      UNREACHABLE("VkBindImageMemoryInfo with no memory");
+      return tu_bind_android_native_buffer(device, image, bind_info);
 #else
       const VkBindImageMemorySwapchainInfoKHR *swapchain_info =
          vk_find_struct_const(bind_info->pNext,
@@ -1635,4 +1696,3 @@ tu_bind_sparse_image(struct tu_device *device, void *submit,
                          prev_bo_offset, bind_range);
    }
 }
-

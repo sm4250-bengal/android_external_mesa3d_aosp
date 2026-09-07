@@ -33,6 +33,11 @@ struct tu_image
 {
    struct vk_image vk;
 
+#if DETECT_OS_ANDROID
+   /* Deferred ANB memory is freed with the image's allocation callbacks. */
+   VkAllocationCallbacks anb_allocator;
+#endif
+
    struct fdl_layout layout[3];
    uint64_t subsampled_metadata_offset;
    uint64_t total_size;
