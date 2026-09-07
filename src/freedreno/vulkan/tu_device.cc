@@ -3587,10 +3587,6 @@ tu_AllocateMemory(VkDevice _device,
        */
       result = tu_bo_init_dmabuf(device, &mem->bo,
                                  pAllocateInfo->allocationSize, fd_info->fd);
-      if (result == VK_SUCCESS) {
-         /* take ownership and close the fd */
-         close(fd_info->fd);
-      }
    } else if (mem->vk.ahardware_buffer) {
 #if DETECT_OS_ANDROID
       const native_handle_t *handle = AHardwareBuffer_getNativeHandle(mem->vk.ahardware_buffer);
@@ -3646,7 +3642,9 @@ tu_AllocateMemory(VkDevice _device,
 
    if (result == VK_SUCCESS && !mem->lazy) {
       result = tu_add_to_heap(device, mem->bo);
-      mem->iova = mem->bo->iova;
+      /* Heap rejection already releases the attempted BO reference. */
+      if (result == VK_SUCCESS)
+         mem->iova = mem->bo->iova;
    }
 
    if (result != VK_SUCCESS) {
@@ -3666,6 +3664,12 @@ tu_AllocateMemory(VkDevice _device,
    TU_RMV(heap_create, device, pAllocateInfo, mem);
 
    tu_memory_emit_report(device, mem, pAllocateInfo, VK_SUCCESS);
+
+   /* An imported fd remains caller-owned on every allocation error. Consume
+    * it only after heap admission and all other fallible work have succeeded.
+    */
+   if (fd_info && fd_info->handleType)
+      close(fd_info->fd);
 
    *pMem = tu_device_memory_to_handle(mem);
 
